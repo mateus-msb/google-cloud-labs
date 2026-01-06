@@ -5,7 +5,7 @@
 set -e
 
 # Declare variables
-ZONE="us-west3-a"
+ZONE="us-east4-b"
 REGION="${ZONE%-*}"
 
 INSTANCE_NAME="www"
@@ -14,12 +14,19 @@ INSTANCE_LIST=()
 TAGS="network-lb-tag"
 MACHINE_TYPE="e2-small"
 FIREWALL_RULE="www-firewall-network-lb"
+TRAFFIC="ingress"
 PORT="80"
+
 BACKEND_TEMPLATE="lb-backend-template"
-EXTERNAL_IP="network-lb-ip-1"
-TARGET_POOL="www-pool"
+BACKEND_TAGS="allow-health-check"
+MANAGED_INSTANCE_GROUP="lb-backend-group"
+FW_ALLOW_HEALTH_CHECK="fw-allow-health-check"
+ALLOW_RANGES="130.211.0.0/22,35.191.0.0/16"
+
+EXTERNAL_IP="lb-ipv4-1"
 HEALTH_CHECK="http-basic-check"
-FORWARDING_RULE="www-rule"
+URL_MAP="web-map-http"
+TARGET_HTTP_PROXY="http-lb-proxy"
 
 echo "Starting HTTP Load Balancer setup for Compute Engine"
 
@@ -68,13 +75,90 @@ gcloud compute addresses create $EXTERNAL_IP \
 
 echo "Static external IP address $EXTERNAL_IP created"
 
-
 # Create the load balancer template
+gcloud compute instance-templates create $BACKEND_TEMPLATE \
+   --region=$REGION \
+   --network=default \
+   --subnet=default \
+   --tags=$BACKEND_TAGS \
+   --machine-type=e2-medium \
+   --image-family=debian-12 \
+   --image-project=debian-cloud \
+   --metadata=startup-script='#!/bin/bash
+     apt-get update
+     apt-get install apache2 -y
+     a2ensite default-ssl
+     a2enmod ssl
+     vm_hostname="$(curl -H "Metadata-Flavor:Google" \
+     http://169.254.169.254/computeMetadata/v1/instance/name)"
+     echo "Page served from: $vm_hostname" | \
+     tee /var/www/html/index.html
+     systemctl restart apache2'
+
+echo "Instance template $BACKEND_TEMPLATE created"
 
 # Create a managed instance group
+gcloud compute instance-groups managed create $MANAGED_INSTANCE_GROUP \
+   --template=$BACKEND_TEMPLATE --size=2 --zone=$ZONE
 
 # Create the  firewall rule
+gcloud compute firewall-rules create $FW_ALLOW_HEALTH_CHECK \
+  --network=default \
+  --action=allow \
+  --direction=$TRAFFIC \
+  --source-ranges=$ALLOW_RANGES \
+  --target-tags=$BACKEND_TAGS \
+  --rules=tcp:$PORT
 
 # Set up a global static external IP
+gcloud compute addresses create $EXTERNAL_IP \
+  --ip-version=IPV4 \
+  --global
 
+IPV4_ADDRESS=$(gcloud compute addresses describe $EXTERNAL_IP \
+  --format="get(address)" --global)
 echo "Static external IP address created: $IPV4_ADDRESS"
+
+# Create a health check for the load balancer
+gcloud compute health-checks create http $HEALTH_CHECK \
+  --port $PORT
+
+echo "Health check $HEALTH_CHECK created"
+
+# Create a backend service
+gcloud compute backend-services create web-backend-service \
+  --protocol=HTTP \
+  --port-name=http \
+  --health-checks=$HEALTH_CHECK \
+  --global
+
+echo "Backend service web-backend-service created"
+
+# Add the instance group to the backend service
+gcloud compute backend-services add-backend web-backend-service \
+  --instance-group=$MANAGED_INSTANCE_GROUP \
+  --instance-group-zone=$ZONE \
+  --global
+
+echo "Instance group $MANAGED_INSTANCE_GROUP added to backend service"
+
+# Create a URL map to route the incoming requests
+gcloud compute url-maps create $URL_MAP \
+    --default-service web-backend-service
+
+echo "URL map $URL_MAP created"
+
+# Create a target HTTP proxy to route requests to your URL map
+gcloud compute target-http-proxies create $TARGET_HTTP_PROXY \
+    --url-map $URL_MAP
+
+echo "Target HTTP proxy $TARGET_HTTP_PROXY created"
+
+# Create a global forwarding rule to route incoming requests
+gcloud compute forwarding-rules create http-content-rule \
+   --address=$EXTERNAL_IP \
+   --global \
+   --target-http-proxy=$TARGET_HTTP_PROXY \
+   --ports=$PORT
+
+echo "Forwarding rule http-content-rule created"
